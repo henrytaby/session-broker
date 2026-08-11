@@ -200,8 +200,10 @@ pip-selfcheck.json
 
 # Datos generados por el cliente (perfil local, cookies, descargas, zip temporal)
 # La estructura de carpetas se preserva con .gitkeep, el contenido NO se sube.
-client/data/chrome_profile_local/
-client/data/Descargas_Bot/
+client/data/chrome_profile_local/*
+!client/data/chrome_profile_local/.gitkeep
+client/data/Descargas_Bot/*
+!client/data/Descargas_Bot/.gitkeep
 client/data/profile_download.zip
 
 # Cookies desencriptadas locales del cliente (sensibles)

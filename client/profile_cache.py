@@ -59,20 +59,35 @@ class ProfileCache:
             log.info("perfil cacheado (< 1h), reutilizando: %s", self._dir)
             return True
 
-        log.info("descargando perfil completo del servidor...")
-        zip_path = self._dir / "profile_download.zip"
+        self._dir.mkdir(parents=True, exist_ok=True)
+        # Download to a sibling temp file OUTSIDE self._dir: self._dir is wiped
+        # before extraction, so a zip stored inside it would be deleted too.
+        zip_path = self._dir.parent / "profile_download.zip"
         try:
             http.download_file("/profile_zip", zip_path)
         except Exception as e:
             log.warning("error descargando perfil: %r — modo solo-cookies", e)
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
             return False
 
-        if zip_path.exists():
+        if zip_path.exists() and zip_path.stat().st_size > 0:
             log.info("extrayendo perfil...")
             if self._dir.exists():
                 shutil.rmtree(self._dir, ignore_errors=True)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(self._dir)
+                self._dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(self._dir)
+            except (zipfile.BadZipFile, OSError) as e:
+                log.warning("zip corrupto o lectura fallida: %r — modo solo-cookies", e)
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+                return False
             remove_lock_files(self._dir)
             try:
                 zip_path.unlink()
@@ -80,5 +95,4 @@ class ProfileCache:
                 pass
             log.info("perfil extraido en: %s", self._dir)
             return True
-        self._dir.mkdir(parents=True, exist_ok=True)
         return False

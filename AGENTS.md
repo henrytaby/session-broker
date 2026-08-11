@@ -150,7 +150,7 @@ puertos Chrome debug es `19220 + i*10` (pc1 → 19230, pc2 → 19240, ...).
 ```
 1. [0/4] Solicita turno al servidor (/lock) — opcional con --no-lock
 2. [1/4] Descarga fingerprint del servidor -> Fingerprint(**json)
-3. [2/4] Descarga profile.zip (51MB) -> extrae a client/data/chrome_profile_local\ (cache 1h, --force bypass)
+3. [2/4] Descarga profile.zip (~20MB) -> extrae a client/data/chrome_profile_local\ (cache 1h, --force bypass)
 4. [3/4] Descarga storage_state (cookies desencriptadas)
 5. [4/4] launch_persistent_context(user_data_dir=chrome_profile_local) -> Chrome con IndexedDB + SW
          -> add_cookies(cookies desencriptadas) -> inyecta por encima de las que Chrome no pudo leer
@@ -301,7 +301,7 @@ Solo se pasan flags que Chrome v150+ acepta sin warnings:
 C:\chrome-sessions\master\              — Perfil ORIGINAL de Chrome (NO se modifica, solo se lee)
 C:\chrome-sessions\pc1\                 — Copia del master (usa el Chrome headless del servidor)
 C:\chrome-sessions\storage_state_live.json  — Cookies desencriptadas (regeneradas cada 3 min)
-C:\chrome-sessions\profile.zip          — Perfil comprimido para clientes (51MB)
+C:\chrome-sessions\profile.zip          — Perfil comprimido para clientes (~20MB; solo login-critico)
 C:\chrome-sessions\fingerprint.json     — Huella de navegador serializada
 
 C:\00gemini\client\data\chrome_profile_local\  — Perfil local del cliente (cacé, < 1h)
@@ -337,3 +337,28 @@ Python nunca abren master con navegador (solo leen sus archivos). Esto es por di
   indicador "pensando" animado; normalización de `<single-image>` → `<img src>`.
 - **AGENTS.md**: sección de auditoría anti-detección + recomendaciones operativas (JA3,
   sesiones concurrentes, mismo Chrome version).
+
+### Cambios recientes (perfil.zip + cliente)
+
+- **Fix bug `rmtree` en `profile_cache.download_and_extract`**: el zip se descargaba
+  *dentro* de `chrome_profile_local/` y luego `shutil.rmtree(self._dir)` lo borraba antes
+  de extraerlo (`FileNotFoundError` en `zipfile.ZipFile`). Ahora se descarga a un sibling
+  `client/data/profile_download.zip` (fuera del dir del profile), se extrae con manejo de
+  `BadZipFile`, y se limpia al final. La carpeta destino se crea siempre con `mkdir(parents=True)`.
+- **Fix bug silencioso en `SKIP_DIRS` (profile_zipper)**: estaba escrito como
+  `"Service Worker\CacheStorage"` (rel-path anidado) pero `os.walk` entrega nombres de
+  dir **simples** (`"CacheStorage"`), así que nunca matcheaba y el zip llevaba ~538MB de
+  CacheStorage. Reescrito para matchear por **nombre simple de un segmento**. El zip pasó
+  de 301.88 MB → 19.88 MB (−93%).
+- **Optimización del profile.zip**: `SKIP_DIRS` ahora también excluye modelos ML de Chrome
+  (`optimization_guide_model_store` 44MB, `OnDeviceHeadSuggestModel` 7.5MB), `Safe Browsing`
+  (20MB), `component_crx_cache` (13.7MB), `ShaderCache`/`GrShaderCache` (7MB),
+  `Crashpad`/`BrowserMetrics`/`*.pma` (telemetría), `File System` (19MB PWA), `Sessions`
+  (se regenera), `DawnWebGPUCache`/`DawnGraphiteCache` (caches de WebGPU). Se conserva todo
+  lo **critico para login**: `IndexedDB` (tokens OAuth), `Service Worker/ScriptCache`
+  (sin CacheStorage), `Network/` (cookies), `Local Storage`, `Login Data`, `Preferences`,
+  `Web Data`, `Account Web Data`, `History`, `Extensions`, `Web Applications`.
+- **Compression**: `compresslevel=1 → 6` (mejor ratio, build < 2s).
+- **`.gitkeep` en `chrome_profile_local/` y `Descargas_Bot/`** + `.gitignore` ajustado
+  (`carpeta/*` + `!carpeta/.gitkeep`) para que la estructura se preserve al clonar el repo
+  sin subir el contenido (evita el `FileNotFoundError` en clones frescos).

@@ -115,6 +115,13 @@ class GeminiCdpSession(IAISession):
     async def initialize(self) -> None:
         from patchright.async_api import async_playwright
 
+        from app.domain.models import Fingerprint
+        from app.infrastructure.fingerprint.chrome_finder import detect_chrome_version
+        from app.infrastructure.fingerprint.fingerprint import (
+            build_context_opts,
+            init_script,
+        )
+
         self._playwright = await async_playwright().start()
         endpoint = f"http://127.0.0.1:{self._cdp_port}"
         log.info("conectando via CDP a %s", endpoint)
@@ -125,9 +132,59 @@ class GeminiCdpSession(IAISession):
         pages = context.pages
         self._page = pages[0] if pages else await context.new_page()
 
+        # CRITICAL anti-detection: pc1 was launched with --headless=new, so its
+        # default UA contains "HeadlessChrome/..." (visible to pages AND reported
+        # by /json/version). CDP-over-UAB cannot change the browser's process
+        # UA after launch, but we CAN inject an init script that rewrites
+        # navigator.userAgent / userAgentData on every page load, and set
+        # sec-ch-ua Client Hints via extra_http_headers. Without this, Gemini
+        # sees "HeadlessChrome" + navigator.webdriver=true on the chat page.
+        cv = detect_chrome_version()
+        fp = Fingerprint(
+            user_agent=(
+                f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{cv}.0.0.0 Safari/537.36"
+            ),
+            platform="Win32",
+            languages=["es-419", "es", "en"],
+            timezone="America/La_Paz",
+            locale="es-419",
+            screen_width=1920,
+            screen_height=1080,
+            color_depth=24,
+            hardware_concurrency=8,
+            device_memory=8,
+            webgl_vendor="Google Inc. (NVIDIA)",
+            webgl_renderer=(
+                "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            ),
+            sec_ch_ua=f'"Chromium";v="{cv}", "Not)A;Brand";v="24", "Google Chrome";v="{cv}"',
+        )
+        try:
+            await context.add_init_script(init_script(fp))
+            ctx_opts = build_context_opts(fp)
+            # viewport/screen are not settable on an existing CDP context,
+            # but extra_http_headers IS (Emulation.setExtraHTTPHeaders).
+            headers = ctx_opts.get("extra_http_headers", {})
+            if headers:
+                await context.set_extra_http_headers(headers)
+            # timezone / locale cannot be set on an existing CDP-linked
+            # context (they're new_context options). The init_script spoofs
+            # navigator.language/languages; for Intl/TZ we rely on the server's
+            # Windows timezone (America/La_Paz) matching the claimed fingerprint.
+        except Exception as e:
+            log.debug("no se pudo inyectar init_script en pc1: %r", e)
+
         current = self._page.url
         if "gemini.google.com" not in current:
             await self._page.goto(self._start_url, wait_until="domcontentloaded")
+        else:
+            # Already on Gemini: reload so the init_script runs (it only runs
+            # on new navigations). This is idempotent on a logged-in session.
+            try:
+                await self._page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
         self._ready = True
         log.info("sesion de Gemini inicializada via CDP (pc1)")
 

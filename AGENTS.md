@@ -362,3 +362,84 @@ Python nunca abren master con navegador (solo leen sus archivos). Esto es por di
 - **`.gitkeep` en `chrome_profile_local/` y `Descargas_Bot/`** + `.gitignore` ajustado
   (`carpeta/*` + `!carpeta/.gitkeep`) para que la estructura se preserve al clonar el repo
   sin subir el contenido (evita el `FileNotFoundError` en clones frescos).
+
+### Cambios recientes (anti-detección headless + flags CLI)
+
+- **UA override en server headless**: Chrome `--headless=new` inyecta `"HeadlessChrome/..."`
+  en `/json/version` y por defecto en `navigator.userAgent` de pc1. Ahora `_launch_args`
+  pasa `--user-agent=Mozilla/5.0 (...) Chrome/<cv>.0.0.0 Safari/537.36`, de modo que
+  `/json/version` reporta `Chrome/151.0.0.0` (no HeadlessChrome). Verificado con
+  `subprocess.Popen` + endpoint CDP. La página del chat ademas recibe `init_script` con
+  `navigator.userAgent` reescrito, así que Gemini no ve HeadlessChrome en ningún nivel.
+- **`init_script` + sec-ch-ua en chat headless (`gemini_cdp_session.initialize`)**: antes
+  pc1 cargaba Gemini con `navigator.webdriver=true`, UA HeadlessChrome, plugins vacios,
+  sin userAgentData. Ahora se inyecta el mismo `init_script` del cliente (webdriver,
+  plugins, window.chrome, WebGL, audio, font, battery, sec-ch-ua) en el context via CDP,
+  se setean `sec-ch-ua*` Client Hints via `set_extra_http_headers`, y se recarga la pagina
+  para que el script corra. pc1 ahora se ve identico a un Chrome real del cliente.
+- **Quitar flags deprecados del server (`_launch_args`)**: removidos `--disable-blink-features=
+  AutomationControlled` (deprecado v150+, patchright lo hace por CDP), `--no-sandbox`
+  (security warning), `--disable-infobars` (deprecated), `--disable-gpu` (rompia WebGL
+  spoofing del init_script), `--disable-features=IsolateOrigins,site-per-process` (rompe
+  site isolation, dejaba cross-origin leaky). Remplazado por `--disable-features=ChromeCleanup`
+  (mas conservador) + el UA override.
+- **`IGNORE_DEFAULT_ARGS` del cliente ampliado**: ahora strip-ea del array por defecto de
+  patchright los flags puramente de automatización (`--export-tagged-pdf`, `--disable-breakpad`,
+  `--no-service-autorun`, `--disable-dev-shm-usage`, `--disable-edgeupdater`, `--edge-skip-compat-layer-relaunch`,
+  `--disable-search-engine-choice-screen`, `--disable-hang-monitor`, `--disable-prompt-on-repost`).
+  No son visibles desde JS, pero dejan huellas observables (timings, ausencia de breakpad,
+  color rendering). No se strip-ea `--force-color-profile=srgb`, `--enable-features=CDPScreenshotNewSurface`
+  (necesarios para screenshots estables del chat) ni `--disable-blink-features=AutomationControlled`
+  (doble capa anti-webdriver: CLI + CDP patch de patchright).
+
+### Cambios recientes (hybrid config — patchright Best Practice + init_script)
+
+- **Investigación empírica de patchright + `channel="chrome"`**: probamos Chrome
+  real v151 con patchright vanilla (sin UA override, sin init_script, sin headers
+  custom) contra `bot.sannysoft.com`. Resultado: Chrome nativo ya envía UA
+  `Chrome/151.0.0.0` (no HeadlessChrome), `navigator.webdriver=false` (patchright
+  patches en blink layer), `chrome.csi`+`chrome.loadTimes` como `function`,
+  `chrome.runtime=undefined` (igual que Chrome real sin extensiones), `plugins.length=5`.
+  **Patchright reproduce exactamente un Chrome real normal.**
+- **Quitar `--user-agent=` CLI override (cliente)**: Chrome real no-headless envía
+  nativamente `Chrome/<cv>.0.0.0` coherente con su handshake TLS (JA3). Sobreescribir
+  el UA vía CLI generaba mismatch entre UA-string (lo que la pagina ve) y JA3 (lo que
+  el binario envía en el handshake). Patchright Best Practice dice: NO overriding
+  user_agent cuando `channel="chrome"`.
+- **Quitar `sec-ch-ua*` Client Hints override**: lo mismo — Chrome nativo envía
+  `sec-ch-ua` Client Hints coherentes con el binario. Override = mismatch con JA3.
+  El `init_script` queda a cargo de spoofear `navigator.userAgentData` (en el JS
+  layer, no en headers) para que las PCs de la LAN se vean identificas.
+- **Migración `add_init_script` -> `page.evaluate(..., isolated_context=False)` en
+  `domcontentloaded`**: `patchright-python` NO aplica `add_init_script` (silenciosamente
+  captura el error del `Page.addScriptToEvaluateOnNewDocument`). Lo verificamos con
+  tests: ni `add_init_script` context ni `page.add_init_script` ni llamadas directas
+  a `Page.addScriptToEvaluateOnNewDocument` vía CDP se ejecutan. La alternativa que
+  SÍ funciona es `page.evaluate(script, isolated_context=False)` (param patchright
+  nativo) en cada evento `domcontentloaded` (un `page.on("domcontentloaded", ...)`).
+  Limitación: scripts anti-bot que corren en `document_start` verían el navigator
+  unspoofeado durante ~10-100ms antes del domcontentloaded. Trade-off aceptado porque
+  la mayoría de detectors leen navigator en DOMContentLoaded o después, y porque
+  la alternativa (Override UA vía `--user-agent` / `user_agent` context) desincroniza
+  el JA3 — peor vector.
+- **`window.chrome.runtime` spoof removido**: empiricamente Chrome real v151 (no-headless,
+  sin extensiones) tiene `chrome.runtime === undefined`. Mi init_script intentaba
+  `chrome.runtime = {}` → era **contraproducente** (huella anómala). Ahora el
+  init_script solo rellena `csi` y `loadTimes` si no existen (que en patchright+channel="chrome"
+  ya existen, así que no toca nada). `chrome.runtime` queda como Chrome real (`undefined`).
+- **Tests `network-visible`**: a `bot.sannysoft.com` con la config hybrid, todas
+  las verificaciones pasan: `webdriver=false`, UA=`Chrome/151.0.0.0`, `platform=Win32`,
+  `plugins.length=5`, `chrome.csi/loadTimes=function`, `userAgentData.brands` reales
+  de Chrome v151.
+
+### Cambios pendientes / residual (no abordados)
+
+- **TLS fingerprint (JA3/JA4)**: dependen del binario Chrome y no se pueden spoofear desde
+  Python. La unica mitigacion es mantener todas las PCs de la LAN en la misma version major
+  de Chrome (auto-updates). El `reconcile_chrome_version` ajusta UA pero no JA3.
+- **Server headless TZ/locale**: no seteable en `connect_over_cdp` (es opcion de
+  `new_context`). Depende del timezone de Windows del servidor. Asegurarse que el servidor
+  tenga TZ `America/La_Paz` para matchear la fingerprint.
+- **Calls de `set_timezone`/`Emulation.setTimezoneOverride` via raw CDP**: se podria
+  invocar manualmente en pc1 via `page._context._session.send("Emulation.setTimezoneOverride",
+  {timeZoneId: "America/La_Paz"})` para forzar TZ Match. No implementado (riesgo bajo en LAN).

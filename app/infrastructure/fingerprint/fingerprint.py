@@ -69,13 +69,26 @@ def reconcile_chrome_version(fp: Fingerprint, local_chrome_version: int | None =
 def build_chromium_args(fp: Fingerprint) -> list[str]:
     """Flags for chromium.launch(). Only flags Chrome accepts without warnings.
 
-    Patchright already handles anti-detection internally (webdriver, automation
-    flags). We must NOT add --disable-blink-features=AutomationControlled nor
-    --disable-infobars: Patchright patches them via CDP, and Chrome v150+ prints
-    warnings for those flags.
+    Per patchright's "Best Practice" (https://github.com/Kaliiiiiiiiii-Vinyzu/
+    patchright-python#best-practice), do NOT override user_agent or sec-ch-ua via
+    CLI when using channel="chrome": Chrome's native UA is already the correct
+    `Chrome/<cv>.0.0.0` (NOT HeadlessChrome in non-headless mode), and the
+    sec-ch-ua Client Hints Chrome auto-sends match the local binary's TLS
+    fingerprint (JA3/JA4). Overriding them here can only introduce mismatches
+    between what the page sees (UA-string) and the actual TLS handshake.
+
+    Patchright injects `--disable-blink-features=AutomationControlled` itself
+    in its default args (patching navigator.webdriver at the blink layer). We
+    don't strip it; Chrome v150+ shows a yellow "unsupported flag" infobar but
+    that infobar is LOCAL (web pages cannot read infobars) and patchright's
+    auto-removal of --enable-automation --no-sandbox etc. already covers the
+    main automation flags.
+
+    The fingerprint's UA/sec_ch_ua fields are still consumed by init_script()
+    to spoof navigator.userAgentData for cross-PC consistency, but the CLI /
+    headers no longer override what Chrome natively sends.
     """
     return [
-        f"--user-agent={fp.user_agent}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
@@ -93,20 +106,33 @@ def build_chromium_args(fp: Fingerprint) -> list[str]:
 
 
 def build_context_opts(fp: Fingerprint) -> dict:
-    """Options for browser.new_context() syncing TZ/locales/screen."""
+    """Options for browser.new_context() syncing TZ/locales/screen.
+
+    Per patchright's "Best Practice" (https://github.com/Kaliiiiiiiiii-Vinyzu/
+    patchright-python#best-practice) we do NOT set user_agent or sec-ch-ua*
+    extra HTTP headers: Chrome's native client hints already match the local
+    binary's TLS (JA3/JA4) handshake. Overriding them would desync the network
+    layer (JA3 from binary Chrome/151) from the page layer
+    (UA-string we'd inject) and let Google correlate "same account, different
+    device". The init_script() handles navigator.userAgentData / sec-ch-ua
+    at the JS layer for cross-PC consistency without touching the wire.
+
+    We still set timezone_id, locale, geolocation, accept-language header and
+    viewport/screen — those need user-visible spoofing (TZ / screen size /
+    language in the language list) that Chrome does not derive from the binary.
+    """
     return {
         "viewport": {"width": fp.screen_width, "height": fp.screen_height},
         "screen": {"width": fp.screen_width, "height": fp.screen_height},
-        "user_agent": fp.user_agent,
         "locale": fp.locale,
         "timezone_id": fp.timezone,
         "geolocation": {"longitude": -68.15, "latitude": -16.50, "accuracy": 100},
         "permissions": ["geolocation"],
         "color_scheme": "light",
         "extra_http_headers": {
-            "sec-ch-ua": fp.sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            # accept-language stays: it's not user-agent dependent and our
+            # claimed locales list (es-419, es, en) is part of the shared
+            # fingerprint across all PCs on the LAN.
             "accept-language": f"{fp.languages[0]},{fp.languages[0]};q=0.9,en;q=0.8",
         },
     }
@@ -165,13 +191,17 @@ def init_script(fp: Fingerprint) -> str:
     }});
   }} catch(e){{}}
 
-  // window.chrome
+  // window.chrome spoof: emperically verified (Chrome v151 + channel="chrome"
+  // non-headless) that bare Chrome exposes `window.chrome = {{}}` with only
+  // `csi` and `loadTimes` as real functions. `chrome.runtime` is `undefined`
+  // when no extension is installed — patchright+channel="chrome" already
+  // reproduces this *exactly*. So we ONLY add the functions if they don't
+  // exist (don't pollute `chrome.runtime` / `chrome.app` which a page could
+  // check for extension context).
   try {{
-    window.chrome = window.chrome || {{}};
-    window.chrome.runtime = window.chrome.runtime || {{}};
-    window.chrome.app = window.chrome.app || {{ isInstalled: false }};
-    window.chrome.csi = window.chrome.csi || (() => {{}});
-    window.chrome.loadTimes = window.chrome.loadTimes || (() => ({{}}));
+    if (!window.chrome) window.chrome = {{}};
+    if (!window.chrome.csi) window.chrome.csi = () => {{}};
+    if (!window.chrome.loadTimes) window.chrome.loadTimes = () => ({{}});
   }} catch(e){{}}
 
   // permissions API

@@ -26,24 +26,42 @@ def test_fingerprint_roundtrip():
     assert restored == fp
 
 
-def test_build_chromium_args_contains_lang_and_useragent():
+def test_build_chromium_args_lang_no_useragent_override():
+    """Per patchright Best Practice, we do NOT override --user-agent on the
+    CLI when channel="chrome": Chrome's native UA is already the correct
+    `Chrome/<cv>.0.0.0` and overrides would risk mismatches with the binary's
+    actual TLS (JA3/JA4) handshake. The UA/sec-ch-ua spoofing is handled by
+    init_script() at the JS layer instead."""
     fp = default_fingerprint(chrome_version=140)
     args = build_chromium_args(fp)
-    assert any(a.startswith("--user-agent=") for a in args)
+    assert not any(a.startswith("--user-agent=") for a in args)
     assert "--lang=es-419" in args
     assert "--start-maximized" in args
-    # Patchright-managed flags must NOT be present (would warn on Chrome v150+)
+    # Patchright-managed flags must NOT be present in OUR args (patchright
+    # injects its own defaults separately); --disable-blink-features=
+    # AutomationControlled is patchright's, not ours.
     assert "--disable-blink-features=AutomationControlled" not in args
     assert "--disable-infobars" not in args
 
 
-def test_build_context_opts_has_tz_and_headers():
+def test_build_context_opts_tz_locale_no_ua_secchua():
+    """Per patchright Best Practice, do NOT set user_agent / sec-ch-ua* extra
+    headers: Chrome's native hints match the binary's TLS fingerprint. We
+    still set timezone_id, locale, and accept-language (network-visible parts
+    that Chrome does not derive from the binary)."""
     fp = default_fingerprint(chrome_version=140)
     opts = build_context_opts(fp)
     assert opts["timezone_id"] == "America/La_Paz"
     assert opts["locale"] == "es-419"
-    assert opts["extra_http_headers"]["sec-ch-ua"] == fp.sec_ch_ua
-    assert opts["extra_http_headers"]["sec-ch-ua-platform"] == '"Windows"'
+    # user_agent is no longer set on context opts
+    assert "user_agent" not in opts
+    headers = opts["extra_http_headers"]
+    # accept-language stays (it's part of the shared fingerprint)
+    assert headers.get("accept-language", "").startswith(fp.languages[0])
+    # sec-ch-ua* are no longer injected as custom headers
+    assert "sec-ch-ua" not in headers
+    assert "sec-ch-ua-mobile" not in headers
+    assert "sec-ch-ua-platform" not in headers
 
 
 def test_init_script_contains_spoofs():

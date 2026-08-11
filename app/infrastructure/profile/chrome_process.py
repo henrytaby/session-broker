@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.domain.models import InstanceInfo
 from app.domain.ports.chrome_manager import IChromeInstanceManager
+from app.infrastructure.fingerprint.chrome_finder import detect_chrome_version
 from app.infrastructure.profile.chrome_finder import find_chrome_official
 from app.infrastructure.profile.profile_store import (
     copy_profile_from_master,
@@ -62,22 +63,39 @@ class ChromeInstanceManager(IChromeInstanceManager):
 
     def _launch_args(self, instance_name: str, chrome_port: int) -> list[str]:
         user_data = settings.SESSIONS_DIR / instance_name
+        # NOTE: --disable-blink-features=AutomationControlled is intentionally
+        # NOT set. It's deprecated on Chrome v150+ (prints a warning), and
+        # patchright (used via connect_over_cdp in the chat) patches
+        # navigator.webdriver over CDP at runtime instead. Likewise --no-sandbox
+        # / --disable-infobars are omitted on purpose (security warnings /
+        #   deprecated respectively).
+        # NOTE on UA: Chrome's --headless=new injects "HeadlessChrome" in the
+        # UA by default, which is a strong automation signal. We override it
+        # with the real Chrome UA (major detected) so /json/version + pages
+        # report Chrome/151..., matching what real Chrome would send.
+        cv = detect_chrome_version()
+        ua = (
+            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{cv}.0.0.0 Safari/537.36"
+        )
         return [
             self._chrome_exe,
             f"--user-data-dir={user_data}",
             "--profile-directory=Default",
             f"--remote-debugging-port={chrome_port}",
             "--headless=new" if self._headless else "--headless=false",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process,ChromeCleanup",
-            "--disable-infobars",
+            f"--user-agent={ua}",
+            # Site-isolation: keep default; do NOT disable site-per-process
+            # (it leaks cross-origin in headless). Only disable Chrome Cleanup.
+            "--disable-features=ChromeCleanup",
             "--window-size=1920,1080",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-networking",
             "--disable-sync",
-            "--disable-gpu",
-            "--no-sandbox",
+            # No --disable-gpu: WebGL spoofing in init_script needs a working
+            # GL stack; software-swiftshader is fine and avoids the "WebGL
+            # disabled" fingerprint giveaway.
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",

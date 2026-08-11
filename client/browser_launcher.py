@@ -14,11 +14,34 @@ from app.infrastructure.fingerprint.fingerprint import (
 
 log = get_logger(__name__)
 
+# patchright/playwright inject several automation flags at launch that are
+# invisible to JS (no page can read chrome://version or process args) but leave
+# observable side effects (no crash reporter, tagged-PDF export mode, Edge-specific
+# quirks, etc.). We strip the most obviously "automation-only" ones to reduce the
+# passive fingerprinting of the client profile. We DO NOT strip:
+#   --force-color-profile=srgb  -> needed for consistent screenshots
+#   --enable-features=CDPScreenshotNewSurface -> same
+#   --disable-blink-features=AutomationControlled -> patchright's MAIN patch for
+#     navigator.webdriver. Chrome v150+ shows a yellow "unsupported flag" infobar
+#     when it sees this flag, but that infobar is LOCAL (the user sees it, web pages
+#     can NOT read infobars). Removing the flag re-exposes navigator.webdriver=true
+#     which IS a real detection vector, so we keep the flag + accept the infobar.
+#     See https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python#command-flags-leaks
 IGNORE_DEFAULT_ARGS = [
+    # ours / explicit exclusions, never passed through:
     "--enable-automation",
     "--no-sandbox",
-    "--disable-blink-features=AutomationControlled",
     "--disable-features=Automation",
+    # patchright-injected, automation-only, observable side effects:
+    "--export-tagged-pdf",
+    "--disable-breakpad",
+    "--no-service-autorun",
+    "--disable-dev-shm-usage",
+    "--disable-edgeupdater",
+    "--edge-skip-compat-layer-relaunch",
+    "--disable-search-engine-choice-screen",
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
 ]
 
 
@@ -115,23 +138,59 @@ class BrowserLauncher:
                 **ctx_opts,
             )
 
+    def _install_init_script(self, page, fp: Fingerprint) -> None:
+        """Inject the fingerprint init-script into the page's main world.
+
+        patchright-python (with channel="chrome") intentionally swallows
+        the result of `context.add_init_script` — empirically verified that
+        our spoofs do NOT apply when added via add_init_script, because
+        patchright patches `Runtime.enable` / `Page.addScriptToEvaluateOnNewDocument`
+        in a way that prevents the script from running in Chrome's own context.
+
+        Replacement: listen to each page's `domcontentloaded` event and run
+        the init script directly via `page.evaluate(..., isolated_context=False)`
+        — the patchright-extended `evaluate` skips the isolated utility world
+        and runs in Chrome's main world instead. Limitation of note: scripts
+        that fire on `document_start` (before `domcontentloaded`) would see the
+        unspoofed `navigator` for ~10-100ms; we accept this trade-off because
+        a) most modern anti-bot detectors read navigator at `DOMContentLoaded`
+        or later, and b) the alternative (override via `--user-agent` CLI /
+        `browser.new_context(user_agent=)` headers) desyncs the page UA-string
+        from the binary's TLS handshake (JA3/JA4), which is a far worse vector.
+        """
+        script = init_script(fp)
+
+        def _inject(p) -> None:
+            try:
+                p.evaluate(script, isolated_context=False)
+            except Exception:
+                pass  # page may have navigated away / been closed
+
+        page.on("domcontentloaded", _inject)
+        if page.url and page.url != "about:blank":
+            _inject(page)
+
     def _run_full_profile(self, p, fp, ss_data, profile_dir, css, ctx_opts, start_url) -> None:
         print("  Modo: perfil completo (launch_persistent_context)")
         print(f"  Directorio perfil: {profile_dir}")
 
         context = self._launch_persistent(p, profile_dir, css, ctx_opts)
-        context.add_init_script(init_script(fp))
 
         cookie_objects = build_cookie_objects(ss_data)
         print(f"  Inyectando {len(cookie_objects)} cookies desencriptadas...")
         context.add_cookies(cookie_objects)
 
         page = context.pages[0] if context.pages else context.new_page()
+        # Inject the fingerprint spoofs into every page's main world. See
+        # _install_init_script docstring for why we don't use add_init_script.
+        self._install_init_script(page, fp)
+        context.on("page", lambda pg: (
+            self._install_init_script(pg, fp),
+            pg.on("download", self._on_download),
+        ))
+        page.on("download", self._on_download)
         print(f"  Navegando a: {start_url}")
         page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-
-        context.on("page", lambda pg: pg.on("download", self._on_download))
-        page.on("download", self._on_download)
 
         self._report(page.url)
         try:
@@ -160,10 +219,13 @@ class BrowserLauncher:
             )
 
         context = browser.new_context(storage_state=ss_data, accept_downloads=True, **ctx_opts)
-        context.add_init_script(init_script(fp))
 
-        context.on("page", lambda pg: pg.on("download", self._on_download))
         page = context.new_page()
+        self._install_init_script(page, fp)
+        context.on("page", lambda pg: (
+            self._install_init_script(pg, fp),
+            pg.on("download", self._on_download),
+        ))
         page.on("download", self._on_download)
 
         print(f"  Navegando a: {start_url}")

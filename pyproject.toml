@@ -1,0 +1,22 @@
+[project]
+name = "session-sharing"
+version = "9.0.0"
+description = "Gestión de sesiones de navegador (servidor + clientes LAN) + chat Gemini vía CDP"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["old", "venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]

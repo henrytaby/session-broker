@@ -192,7 +192,7 @@ class BrowserLauncher:
         print(f"  Navegando a: {start_url}")
         page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
 
-        self._report(page.url)
+        self._report(page)
         try:
             page.wait_for_event("close", timeout=0)
         except Exception:
@@ -231,7 +231,7 @@ class BrowserLauncher:
         print(f"  Navegando a: {start_url}")
         page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
 
-        self._report(page.url, cookies_only=True)
+        self._report(page, cookies_only=True)
         try:
             page.wait_for_event("close", timeout=0)
         except Exception:
@@ -241,20 +241,60 @@ class BrowserLauncher:
         except Exception:
             pass
 
-    def _report(self, final_url: str, cookies_only: bool = False) -> None:
-        needs_login = (
+    def _report(self, page, cookies_only: bool = False) -> None:
+        """Report session status based on the actual rendered page, not just the
+        URL. Gemini's homepage (`https://gemini.google.com/`) is served BOTH when
+        logged in (chat UI) and when logged out (Sign-in button), so a URL-only
+        check is a false positive. We probe the DOM for a logged-out signal."""
+        final_url = page.url
+        mode = "solo cookies" if cookies_only else "perfil completo (IndexedDB + SW + cookies)"
+
+        # Cheap URL-based signals first (redirects to the login flow are
+        # unambiguous). If the URL looks fine, we still need a DOM probe because
+        # gemini.google.com renders the sign-in button in place (same URL).
+        url_login = (
             "accounts.google.com" in final_url
             or "signin" in final_url.lower()
             or "ServiceLogin" in final_url
         )
+
+        logged_in = not url_login
+        if logged_in:
+            # Give SPA a moment to render, then probe for a sign-in affordance.
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            try:
+                # Gemini's sign-in surfaces: a visible "Sign in" button, or the
+                # URL param returned= (Google auth interstitial). Query one and
+                # short-circuit.
+                has_signin = page.evaluate(
+                    """() => {
+                        const txt = (document.body && document.body.innerText) || '';
+                        const a = Array.from(document.querySelectorAll('a,button')).find(el =>
+                            /^\\s*(Sign in|Inicia sesi[óo]n)\\s*$/i.test(el.textContent || ''));
+                        return !!(a || txt.includes('Sign in') || txt.includes('Inicia sesi'));
+                    }"""
+                )
+                # `returned=` query param on the gemini landing is the sign-in
+                # intermediate; treat it as logged out.
+                if "returned=" in final_url:
+                    has_signin = True
+                if has_signin:
+                    logged_in = False
+            except Exception:
+                # Page may still be loading; fall through to URL verdict already set.
+                pass
+
         print("\n" + "=" * 55)
-        if needs_login:
+        if not logged_in:
             print("  [!] Google pidio login. Posibles causas:")
             print("      - Servidor: abre Chrome con la cuenta y verifica sesion activa")
             print("      - Cookies expiradas: reinicia servidor con --refresh")
+            print("      - Perfil local contaminado: python client.py --force")
         else:
             print(f"  Sesion activa - URL: {final_url}")
-        mode = "solo cookies" if cookies_only else "perfil completo (IndexedDB + SW + cookies)"
         print(f"  Perfil: {mode}")
         print(f"  Descargas -> {self._downloads}")
         print("  Cierra la ventana para salir.")
